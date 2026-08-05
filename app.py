@@ -152,7 +152,7 @@ def process_images(image_files, model, save_images, conf_threshold):
     return results_data, result_images, frame_images
 
 def process_video(video_bytes, model, fps, save_images, save_frames, conf_threshold):
-    """处理视频：抽帧 -> 识别"""
+    """处理视频：先精确计数帧数，再按帧率抽帧识别"""
     # 保存视频到临时文件
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         tmp_file.write(video_bytes)
@@ -163,7 +163,21 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
         raise ValueError("无法打开视频文件")
     
     video_fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    if video_fps <= 0:
+        video_fps = 25.0  # 如果读取帧率失败，给一个默认值
+    
+    # ===== 【关键修改】手动遍历所有帧进行精确计数 =====
+    precise_frame_count = 0
+    while True:
+        ret, _ = cap.read()
+        if not ret:
+            break
+        precise_frame_count += 1
+    
+    # 重置视频读取位置到开头
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    total_frames = precise_frame_count  # 使用精确计数的结果
+    # ==================================================
     
     # 计算抽帧间隔
     if fps >= video_fps:
@@ -186,7 +200,7 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
         
         if frame_count % frame_interval == 0:
             status_text.text(f"抽帧中: {frame_count}/{total_frames} (间隔 {frame_interval} 帧)")
-            progress_bar.progress(frame_count / total_frames)
+            progress_bar.progress(frame_count / total_frames if total_frames > 0 else 0)
             
             # 生成文件名：使用帧序号（时间戳）
             time_sec = int(frame_count / video_fps)
@@ -214,7 +228,6 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     
     # 如果保存了结果图片，但原始帧图片是空的，且用户要求保存，从结果中提取
     if save_frames and not frame_images:
-        # 从 image_files 中提取原始帧（不带框）
         for name, img in image_files.items():
             is_success, buffer = cv2.imencode(".jpg", img)
             if is_success:
