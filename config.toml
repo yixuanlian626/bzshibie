@@ -1,2 +1,0 @@
-[server]
-maxUploadSize = 1000  # 这里将上传限制修改为你需要的大小，单位是 MB
