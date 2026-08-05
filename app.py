@@ -152,7 +152,7 @@ def process_images(image_files, model, save_images, conf_threshold):
     return results_data, result_images, frame_images
 
 def process_video(video_bytes, model, fps, save_images, save_frames, conf_threshold):
-    """处理视频：先精确计数帧数，再按帧率抽帧识别"""
+    """处理视频：流式抽帧 + 即时识别（内存友好）"""
     # 保存视频到临时文件
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         tmp_file.write(video_bytes)
@@ -164,74 +164,107 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     if video_fps <= 0:
-        video_fps = 25.0  # 如果读取帧率失败，给一个默认值
+        video_fps = 25.0
     
-    # ===== 【关键修改】手动遍历所有帧进行精确计数 =====
+    # ===== 精确计数总帧数 =====
     precise_frame_count = 0
     while True:
         ret, _ = cap.read()
         if not ret:
             break
         precise_frame_count += 1
-    
-    # 重置视频读取位置到开头
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    total_frames = precise_frame_count  # 使用精确计数的结果
-    # ==================================================
+    total_frames = precise_frame_count
+    # ==========================
     
     # 计算抽帧间隔
-    if fps >= video_fps:
-        frame_interval = 1
-    else:
-        frame_interval = int(video_fps / fps)
+    frame_interval = 1 if fps >= video_fps else int(video_fps / fps)
     
-    # 准备图片数据
-    image_files = {}
+    # ===== 结果存储（只存文本，不存图片） =====
+    results_data = []
+    result_images = {}      # 只存用户要求保存的带框图片（少量）
+    frame_images = {}       # 只存用户要求保存的原始帧（少量）
+    
     frame_count = 0
     extracted_count = 0
     
-    progress_bar = st.progress(0, text="正在抽帧...")
+    progress_bar = st.progress(0, text="正在抽帧并识别...")
     status_text = st.empty()
+    
+    # 决定是否保存图片（只在用户勾选时才存）
+    save_original_frames = save_frames
+    save_result_images = save_images
     
     while True:
         ret, frame = cap.read()
         if not ret:
             break
         
+        # 每隔 frame_interval 帧处理一帧
         if frame_count % frame_interval == 0:
-            status_text.text(f"抽帧中: {frame_count}/{total_frames} (间隔 {frame_interval} 帧)")
+            status_text.text(f"处理中: {frame_count}/{total_frames} (间隔 {frame_interval} 帧)")
             progress_bar.progress(frame_count / total_frames if total_frames > 0 else 0)
             
-            # 生成文件名：使用帧序号（时间戳）
+            # 生成文件名和时间戳
             time_sec = int(frame_count / video_fps)
             filename = f"frame_{time_sec:04d}.jpg"
-            image_files[filename] = frame
+            
+            # ===== 立即识别这一帧 =====
+            results = model(frame, conf=conf_threshold)
+            boxes = results[0].boxes
+            
+            detected = []
+            if boxes is not None and len(boxes) > 0:
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    x_center = float(box.xywh[0][0])
+                    detected.append((x_center, cls, conf))
+            
+            if not detected:
+                full_number = 'N/A'
+                avg_conf = 0.0
+            else:
+                detected.sort(key=lambda x: x[0])
+                digits = [str(d[1]) for d in detected]
+                confidences = [d[2] for d in detected]
+                full_number = ''.join(digits)
+                avg_conf = sum(confidences) / len(confidences)
+            
+            results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
             extracted_count += 1
+            
+            # ===== 只在用户勾选时才保存图片 =====
+            if save_result_images and detected:
+                annotated_img = results[0].plot()
+                is_success, buffer = cv2.imencode(".jpg", annotated_img)
+                if is_success:
+                    result_images[f"result_{time_sec:04d}.jpg"] = buffer.tobytes()
+                    # 限制保存图片数量，防止内存爆炸（最多保存200张）
+                    if len(result_images) > 200:
+                        # 删除最早的图片（保持内存可控）
+                        oldest_key = list(result_images.keys())[0]
+                        del result_images[oldest_key]
+            
+            if save_original_frames:
+                is_success, buffer = cv2.imencode(".jpg", frame)
+                if is_success:
+                    frame_images[f"original_{time_sec:04d}.jpg"] = buffer.tobytes()
+                    # 同样限制数量
+                    if len(frame_images) > 200:
+                        oldest_key = list(frame_images.keys())[0]
+                        del frame_images[oldest_key]
         
         frame_count += 1
     
     cap.release()
     os.unlink(tmp_path)
     
-    st.info(f"📁 从视频中抽取了 {extracted_count} 帧图片")
+    st.info(f"📁 从视频中抽取并识别了 {extracted_count} 帧图片")
     
-    # 设置标记，让 process_images 保存原始帧
-    process_images.save_original_frames = save_frames
-    
-    # 调用统一的处理函数
-    results_data, result_images, frame_images = process_images(
-        image_files, model, save_images, conf_threshold
-    )
-    
-    # 重置标记
-    process_images.save_original_frames = False
-    
-    # 如果保存了结果图片，但原始帧图片是空的，且用户要求保存，从结果中提取
-    if save_frames and not frame_images:
-        for name, img in image_files.items():
-            is_success, buffer = cv2.imencode(".jpg", img)
-            if is_success:
-                frame_images[f"original_{name}"] = buffer.tobytes()
+    # 如果图片数量达到上限，给出提示
+    if len(result_images) >= 200 or len(frame_images) >= 200:
+        st.warning("⚠️ 为节省内存，结果图片仅保留最后200张。如需全部图片，请使用图片压缩包模式。")
     
     return results_data, result_images, frame_images
 
