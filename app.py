@@ -415,10 +415,9 @@ if results_data:
     # ===== 6.3 下载结果 =====
     st.subheader("📥 下载结果")
     
-    # 生成带温度的CSV文件名 - 四位有效数字，两位小数
-    # 例如: 25.00, 100.00, 0.50
+    # 生成带温度的CSV文件名 - 只包含温度数值
     temp_str = f"{temperature:.2f}"
-    csv_filename = f"recognition_results_{temp_str}°C.csv"
+    csv_filename = f"{temp_str}.csv"
     
     col1, col2, col3 = st.columns(3)
     
@@ -442,7 +441,7 @@ if results_data:
                 for fname, data in result_images.items():
                     zip_out.writestr(fname, data)
             # 结果图片ZIP也包含温度信息
-            zip_filename = f"result_images_{temp_str}°C.zip"
+            zip_filename = f"{temp_str}.zip"
             st.download_button(
                 label="🖼️ 下载结果图片 (ZIP)",
                 data=zip_buffer.getvalue(),
@@ -460,7 +459,7 @@ if results_data:
                 for fname, data in frame_images.items():
                     zip_out.writestr(fname, data)
             # 抽帧原图ZIP也包含温度信息
-            zip_filename = f"extracted_frames_{temp_str}°C.zip"
+            zip_filename = f"frames_{temp_str}.zip"
             st.download_button(
                 label="🖼️ 下载抽帧原图 (ZIP)",
                 data=zip_buffer.getvalue(),
