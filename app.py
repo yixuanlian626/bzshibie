@@ -41,6 +41,16 @@ if model is None:
 # ========== 3. 侧边栏：参数设置 ==========
 with st.sidebar:
     st.header("⚙️ 参数设置")
+    
+    # 温度输入 - 四位有效数字，两位小数
+    temperature = st.number_input(
+        "🌡️ 温度 (摄氏度)",
+        value=25.00,
+        step=0.01,
+        format="%.2f",
+        help="输入当前实验温度（四位有效数字，两位小数），将用于CSV文件命名"
+    )
+    
     # 输入源选择
     input_type = st.radio(
         "选择输入类型",
@@ -405,6 +415,11 @@ if results_data:
     # ===== 6.3 下载结果 =====
     st.subheader("📥 下载结果")
     
+    # 生成带温度的CSV文件名 - 四位有效数字，两位小数
+    # 例如: 25.00, 100.00, 0.50
+    temp_str = f"{temperature:.2f}"
+    csv_filename = f"recognition_results_{temp_str}°C.csv"
+    
     col1, col2, col3 = st.columns(3)
     
     with col1:
@@ -415,7 +430,7 @@ if results_data:
         st.download_button(
             label="📊 下载 CSV 结果",
             data=csv_buffer.getvalue(),
-            file_name="recognition_results.csv",
+            file_name=csv_filename,
             mime="text/csv",
             use_container_width=True
         )
@@ -426,10 +441,12 @@ if results_data:
             with zipfile.ZipFile(zip_buffer, 'w') as zip_out:
                 for fname, data in result_images.items():
                     zip_out.writestr(fname, data)
+            # 结果图片ZIP也包含温度信息
+            zip_filename = f"result_images_{temp_str}°C.zip"
             st.download_button(
                 label="🖼️ 下载结果图片 (ZIP)",
                 data=zip_buffer.getvalue(),
-                file_name="result_images.zip",
+                file_name=zip_filename,
                 mime="application/zip",
                 use_container_width=True
             )
@@ -442,10 +459,12 @@ if results_data:
             with zipfile.ZipFile(zip_buffer, 'w') as zip_out:
                 for fname, data in frame_images.items():
                     zip_out.writestr(fname, data)
+            # 抽帧原图ZIP也包含温度信息
+            zip_filename = f"extracted_frames_{temp_str}°C.zip"
             st.download_button(
                 label="🖼️ 下载抽帧原图 (ZIP)",
                 data=zip_buffer.getvalue(),
-                file_name="extracted_frames.zip",
+                file_name=zip_filename,
                 mime="application/zip",
                 use_container_width=True
             )
