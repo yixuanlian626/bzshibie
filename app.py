@@ -350,7 +350,7 @@ if results_data:
     
     # ===== 6.1 显示结果预览 =====
     st.subheader("📊 识别结果预览")
-    df = pd.DataFrame(results_data, columns=['时间(s)', '电动势', '置信度'])
+    df = pd.DataFrame(results_data, columns=['Time (s)', 'EMF (mV)', 'Confidence'])
     st.dataframe(df.head(20), use_container_width=True)
     
     # 统计信息
@@ -424,7 +424,7 @@ if results_data:
     with col1:
         csv_buffer = io.StringIO()
         writer = csv.writer(csv_buffer)
-        writer.writerow(['时间(s)', '电动势', '置信度'])
+        writer.writerow(['Time (s)', 'EMF (mV)', 'Confidence'])
         writer.writerows(results_data)
         st.download_button(
             label="📊 下载 CSV 结果",
