@@ -76,6 +76,25 @@ with st.sidebar:
     save_frames = st.checkbox("保存抽帧原图（仅视频模式）", value=True) if input_type == "🎬 视频文件" else False
     generate_plot = st.checkbox("生成电动势-时间平滑曲线图", value=True)
     
+    st.subheader("⚡ 性能设置")
+    batch_size = st.selectbox(
+        "批处理大小",
+        options=[8, 16, 32, 64],
+        index=1,
+        help="越大越快，但内存占用越高。1920×1080 JPEG 建议 16~32"
+    )
+    use_half_res = st.checkbox(
+        "半分辨率解码（加速）",
+        value=True,
+        help="将 1920×1080 图片解码为 960×540，解码和推理更快；如识别精度下降可关闭"
+    )
+    imgsz = st.selectbox(
+        "推理尺寸 (imgsz)",
+        options=[512, 640, 736, 960],
+        index=1,
+        help="YOLO 推理时的输入尺寸，640 是常用平衡点"
+    )
+    
     st.subheader("🎯 置信度设置")
     conf_threshold = st.slider(
         "模型推理置信度阈值",
@@ -89,7 +108,7 @@ with st.sidebar:
         max_value=1.0,
         step=0.05,
         format="%.2f",
-        help="在模型输出结果上再筛选：只保留置信度 >= 该值的检测结果，低于此值的结果将被剔除"
+        help="对每张图片：计算所有检测数字的平均置信度，若平均置信度 < 该值，则整行删除；否则保留全部数字"
     )
 
 # ========== 4. 核心处理函数 ==========
@@ -109,67 +128,88 @@ def extract_frame_number(filename):
             return int(match.group(1))
     return None
 
-def process_images(image_files, model, conf_threshold, batch_size=8):
-    """处理图片列表（批量推理版）
+def process_zip_streaming(file_bytes, model, conf_threshold,
+                          batch_size=16, use_half_res=True, imgsz=640):
+    """流式从 ZIP 读取图片并批量推理，内存只驻留一个 batch。
     返回 raw_results_data: [(time_sec, raw_detections), ...]
     raw_detections: [(x_center, cls, conf), ...]
     """
     raw_results_data = []
     
-    items = list(image_files.items())
-    total = len(items)
-    
-    progress_bar = st.progress(0, text="开始处理...")
-    status_text = st.empty()
-    
-    for start in range(0, total, batch_size):
-        batch_items = items[start:start + batch_size]
-        batch_names = [name for name, _ in batch_items]
+    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
+        image_infos = [
+            info for info in zip_ref.infolist()
+            if not info.is_dir() and Path(info.filename).suffix.lower()
+            in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']
+        ]
+        total = len(image_infos)
+        
+        if total == 0:
+            return raw_results_data
+        
+        progress_bar = st.progress(0, text="开始处理...")
+        status_text = st.empty()
+        
+        decode_flag = cv2.IMREAD_REDUCED_COLOR_2 if use_half_res else cv2.IMREAD_COLOR
+        
+        batch_names = []
         batch_imgs = []
+        processed_count = 0
+        global_idx = 0
         
-        for name, img_data in batch_items:
-            if isinstance(img_data, bytes):
-                nparr = np.frombuffer(img_data, np.uint8)
-                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-            else:
-                img = img_data
-            batch_imgs.append(img)
-        
-        valid_indices = [i for i, img in enumerate(batch_imgs) if img is not None]
-        valid_imgs = [batch_imgs[i] for i in valid_indices]
-        valid_names = [batch_names[i] for i in valid_indices]
-        
-        if not valid_imgs:
-            continue
-        
-        results = model(valid_imgs, conf=conf_threshold)
-        
-        for idx, (name, result) in enumerate(zip(valid_names, results)):
-            boxes = result.boxes
-            detected = []
-            if boxes is not None and len(boxes) > 0:
-                for box in boxes:
-                    cls = int(box.cls[0])
-                    conf = float(box.conf[0])
-                    x_center = float(box.xywh[0][0])
-                    detected.append((x_center, cls, conf))
+        for info in image_infos:
+            try:
+                img_bytes = zip_ref.read(info.filename)
+                nparr = np.frombuffer(img_bytes, np.uint8)
+                img = cv2.imdecode(nparr, decode_flag)
+            except Exception:
+                img = None
             
-            frame_num = extract_frame_number(name)
-            time_sec = frame_num if frame_num is not None else start + idx
-            # 保存原始检测列表（未筛选）
-            raw_results_data.append((time_sec, detected))
+            if img is not None:
+                batch_names.append(info.filename)
+                batch_imgs.append(img)
+            
+            global_idx += 1
+            
+            if len(batch_imgs) >= batch_size or global_idx == total:
+                if batch_imgs:
+                    results = model(
+                        batch_imgs,
+                        conf=conf_threshold,
+                        imgsz=imgsz,
+                        verbose=False
+                    )
+                    
+                    for name, result in zip(batch_names, results):
+                        boxes = result.boxes
+                        detected = []
+                        if boxes is not None and len(boxes) > 0:
+                            for box in boxes:
+                                cls = int(box.cls[0])
+                                conf = float(box.conf[0])
+                                x_center = float(box.xywh[0][0])
+                                detected.append((x_center, cls, conf))
+                        
+                        frame_num = extract_frame_number(name)
+                        time_sec = frame_num if frame_num is not None else processed_count
+                        raw_results_data.append((time_sec, detected))
+                        processed_count += 1
+                    
+                    del batch_imgs, results
+                    batch_names = []
+                    batch_imgs = []
+                
+                progress_bar.progress(min(global_idx / total, 1.0))
+                status_text.text(f"已处理 {global_idx}/{total} 张")
         
-        progress_bar.progress(min((start + batch_size) / total, 1.0))
-        status_text.text(f"已处理 {min(start + batch_size, total)}/{total} 张")
+        status_text.text("✅ 处理完成！")
+        progress_bar.empty()
     
-    status_text.text("✅ 处理完成！")
-    progress_bar.empty()
     return raw_results_data
 
-def process_video(video_bytes, model, fps, save_frames, conf_threshold):
-    """处理视频：流式抽帧 + 即时识别（内存友好）
-    返回 raw_results_data 和 frame_images
-    """
+def process_video(video_bytes, model, fps, save_frames, conf_threshold,
+                  batch_size=16, imgsz=640):
+    """处理视频：流式抽帧 + 批量识别"""
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         tmp_file.write(video_bytes)
         tmp_path = tmp_file.name
@@ -202,20 +242,16 @@ def process_video(video_bytes, model, fps, save_frames, conf_threshold):
     progress_bar = st.progress(0, text="正在抽帧并识别...")
     status_text = st.empty()
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        if frame_count % frame_interval == 0:
-            status_text.text(f"处理中: {frame_count}/{total_frames} (间隔 {frame_interval} 帧)")
-            progress_bar.progress(frame_count / total_frames if total_frames > 0 else 0)
-            
-            time_sec = int(frame_count / video_fps)
-            
-            results = model(frame, conf=conf_threshold)
-            boxes = results[0].boxes
-            
+    batch_frames = []
+    batch_times = []
+    
+    def flush_batch():
+        nonlocal extracted_count
+        if not batch_frames:
+            return
+        results = model(batch_frames, conf=conf_threshold, imgsz=imgsz, verbose=False)
+        for t_sec, result in zip(batch_times, results):
+            boxes = result.boxes
             detected = []
             if boxes is not None and len(boxes) > 0:
                 for box in boxes:
@@ -223,9 +259,20 @@ def process_video(video_bytes, model, fps, save_frames, conf_threshold):
                     conf = float(box.conf[0])
                     x_center = float(box.xywh[0][0])
                     detected.append((x_center, cls, conf))
-            
-            raw_results_data.append((time_sec, detected))
+            raw_results_data.append((t_sec, detected))
             extracted_count += 1
+        batch_frames.clear()
+        batch_times.clear()
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if frame_count % frame_interval == 0:
+            time_sec = int(frame_count / video_fps)
+            batch_frames.append(frame)
+            batch_times.append(time_sec)
             
             if save_frames:
                 is_success, buffer = cv2.imencode(".jpg", frame)
@@ -234,8 +281,15 @@ def process_video(video_bytes, model, fps, save_frames, conf_threshold):
                     if len(frame_images) > 200:
                         oldest_key = list(frame_images.keys())[0]
                         del frame_images[oldest_key]
+            
+            if len(batch_frames) >= batch_size:
+                flush_batch()
+                progress_bar.progress(frame_count / total_frames if total_frames > 0 else 0)
+                status_text.text(f"处理中: {frame_count}/{total_frames}")
         
         frame_count += 1
+    
+    flush_batch()
     
     cap.release()
     os.unlink(tmp_path)
@@ -243,29 +297,37 @@ def process_video(video_bytes, model, fps, save_frames, conf_threshold):
     st.info(f"📁 从视频中抽取并识别了 {extracted_count} 帧图片")
     
     if len(frame_images) >= 200:
-        st.warning("⚠️ 为节省内存，抽帧原图仅保留最后200张。如需全部图片，请使用图片压缩包模式。")
+        st.warning("⚠️ 为节省内存，抽帧原图仅保留最后200张。")
     
     return raw_results_data, frame_images
 
 def apply_filter(raw_results_data, filter_conf_threshold):
-    """按筛选置信度阈值重新计算识别结果
-    返回 results_data: [[time_sec, full_number, avg_conf], ...]
+    """按筛选置信度阈值过滤：
+    对每张图片，先计算所有检测数字的平均置信度，
+    如果平均置信度 < filter_conf_threshold，则整行删除；
+    否则保留该图片的完整识别结果（不剔除单个数字）。
     """
     results_data = []
     for time_sec, raw_detections in raw_results_data:
-        filtered = [d for d in raw_detections if d[2] >= filter_conf_threshold]
+        if not raw_detections:
+            # 该图片没有检测到任何数字，直接跳过（不写入CSV）
+            continue
         
-        if not filtered:
-            full_number = 'N/A'
-            avg_conf = 0.0
-        else:
-            filtered.sort(key=lambda x: x[0])
-            digits = [str(d[1]) for d in filtered]
-            confidences = [d[2] for d in filtered]
-            full_number = ''.join(digits)
-            avg_conf = sum(confidences) / len(confidences)
+        # 计算这张图所有检测数字的平均置信度
+        confidences = [d[2] for d in raw_detections]
+        avg_conf = sum(confidences) / len(confidences)
+        
+        # 平均置信度低于阈值 → 整行删除
+        if avg_conf < filter_conf_threshold:
+            continue
+        
+        # 保留该图片的完整识别结果（所有数字都保留，不剔除单个数字）
+        raw_detections_sorted = sorted(raw_detections, key=lambda x: x[0])
+        digits = [str(d[1]) for d in raw_detections_sorted]
+        full_number = ''.join(digits)
         
         results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
+    
     return results_data
 
 # ========== 5. 主逻辑：根据输入类型分发 ==========
@@ -282,26 +344,17 @@ if input_type == "📁 图片压缩包 (ZIP)":
         file_hash = hashlib.md5(file_bytes).hexdigest()
         
         if file_hash != st.session_state.processed_file_hash:
-            with st.spinner("📦 正在解压 ZIP 文件..."):
-                image_files = {}
-                with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
-                    for file_info in zip_ref.infolist():
-                        if file_info.is_dir():
-                            continue
-                        ext = Path(file_info.filename).suffix.lower()
-                        if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-                            try:
-                                image_files[file_info.filename] = zip_ref.read(file_info.filename)
-                            except Exception as e:
-                                st.warning(f"无法读取文件: {file_info.filename}, 错误: {e}")
+            st.info("📦 正在流式解压并识别...")
+            raw_results_data = process_zip_streaming(
+                file_bytes, model, conf_threshold,
+                batch_size=batch_size,
+                use_half_res=use_half_res,
+                imgsz=imgsz
+            )
             
-            if not image_files:
-                st.error("❌ ZIP 包中未找到任何支持的图片文件。")
+            if not raw_results_data:
+                st.error("❌ ZIP 包中未找到任何可处理的图片。")
                 st.stop()
-            
-            st.info(f"📁 共找到 {len(image_files)} 张图片")
-            
-            raw_results_data = process_images(image_files, model, conf_threshold)
             
             st.session_state.raw_results_data = raw_results_data
             st.session_state.frame_images = {}
@@ -324,7 +377,8 @@ else:
         if file_hash != st.session_state.processed_file_hash:
             try:
                 raw_results_data, frame_images = process_video(
-                    video_bytes, model, fps_choice, save_frames, conf_threshold
+                    video_bytes, model, fps_choice, save_frames, conf_threshold,
+                    batch_size=batch_size, imgsz=imgsz
                 )
                 
                 st.session_state.raw_results_data = raw_results_data
@@ -343,21 +397,21 @@ raw_results_data = st.session_state.raw_results_data
 frame_images = st.session_state.frame_images
 
 if raw_results_data:
-    # 按筛选置信度阈值重新计算
     results_data = apply_filter(raw_results_data, filter_conf_threshold)
     
     if not results_data:
-        st.error("❌ 未能识别出任何有效数据。")
+        st.warning("⚠️ 所有数据均被筛选掉（平均置信度均低于阈值），请降低筛选置信度阈值。")
         st.stop()
     
     # ===== 6.1 显示结果预览 =====
     st.subheader("📊 识别结果预览")
-    st.caption(f"当前筛选置信度阈值: {filter_conf_threshold:.2f}（低于此值的检测结果已被剔除）")
+    st.caption(f"当前筛选置信度阈值: {filter_conf_threshold:.2f}（整张图平均置信度低于此值的行已被删除）")
     df = pd.DataFrame(results_data, columns=['Time (s)', 'EMF (mV)', 'Confidence'])
     st.dataframe(df.head(20), use_container_width=True)
     
-    valid_count = len([r for r in results_data if r[1] != 'N/A'])
-    st.caption(f"有效识别: {valid_count} / {len(results_data)} 张")
+    total_count = len(raw_results_data)
+    kept_count = len(results_data)
+    st.caption(f"保留: {kept_count} / {total_count} 张（删除 {total_count - kept_count} 张）")
     
     # ===== 6.2 显示曲线图 =====
     if generate_plot and len(results_data) > 1:
@@ -415,8 +469,7 @@ if raw_results_data:
     st.subheader("📥 下载结果")
     
     temp_str = f"{temperature:.2f}"
-    conf_str = f"{filter_conf_threshold:.2f}"
-    csv_filename = f"{temp_str}_conf{conf_str}.csv"
+    csv_filename = f"{temp_str}.csv"
     
     col1, col2 = st.columns(2)
     
