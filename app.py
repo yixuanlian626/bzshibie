@@ -407,7 +407,7 @@ if raw_results_data:
     st.subheader("📊 识别结果预览")
     st.caption(f"当前筛选置信度阈值: {filter_conf_threshold:.2f}（整张图平均置信度低于此值的行已被删除）")
     df = pd.DataFrame(results_data, columns=['Time (s)', 'EMF (mV)', 'Confidence'])
-    st.dataframe(df.head(20), use_container_width=True)
+    st.dataframe(df.head(20), width='stretch')
     
     total_count = len(raw_results_data)
     kept_count = len(results_data)
@@ -483,7 +483,7 @@ if raw_results_data:
             data=csv_buffer.getvalue(),
             file_name=csv_filename,
             mime="text/csv",
-            use_container_width=True
+            width='stretch'
         )
     
     with col2:
@@ -498,9 +498,9 @@ if raw_results_data:
                 data=zip_buffer.getvalue(),
                 file_name=zip_filename,
                 mime="application/zip",
-                use_container_width=True
+                width='stretch'
             )
         else:
-            st.button("🖼️ 下载抽帧原图 (无)", disabled=True, use_container_width=True)
+            st.button("🖼️ 下载抽帧原图 (无)", disabled=True, width='stretch')
     
     st.success("🎉 所有任务完成！")
