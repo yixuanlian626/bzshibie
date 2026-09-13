@@ -92,75 +92,82 @@ def extract_frame_number(filename):
             return int(match.group(1))
     return None
 
-def process_images(image_files, model, save_images, conf_threshold):
-    """处理图片列表（统一处理逻辑）"""
+def process_images(image_files, model, save_images, conf_threshold, batch_size=8):
+    """处理图片列表（批量推理版）"""
     results_data = []
     result_images = {}
-    frame_images = {}  # 用于保存抽帧原图（与结果图片区分）
+    frame_images = {}
+    
+    # 将图片字典转为列表
+    items = list(image_files.items())
+    total = len(items)
+    
     progress_bar = st.progress(0, text="开始处理...")
     status_text = st.empty()
-
-    for idx, (name, img_data) in enumerate(image_files.items()):
-        status_text.text(f"正在处理 [{idx+1}/{len(image_files)}]: {name}")
-        progress_bar.progress((idx + 1) / len(image_files))
-
-        # 从内存读取图片
-        if isinstance(img_data, bytes):
-            nparr = np.frombuffer(img_data, np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        else:
-            # 如果是已经解码的 numpy 数组（来自视频帧）
-            img = img_data
-
-        if img is None:
-            continue
-
-        # 推理
-        results = model(img, conf=conf_threshold)
-        boxes = results[0].boxes
-
-        detected = []
-        if boxes is not None and len(boxes) > 0:
-            for box in boxes:
-                cls = int(box.cls[0])
-                conf = float(box.conf[0])
-                x_center = float(box.xywh[0][0])
-                detected.append((x_center, cls, conf))
-
-        if not detected:
-            full_number = 'N/A'
-            avg_conf = 0.0
-        else:
-            detected.sort(key=lambda x: x[0])
-            digits = [str(d[1]) for d in detected]
-            confidences = [d[2] for d in detected]
-            full_number = ''.join(digits)
-            avg_conf = sum(confidences) / len(confidences)
-
-        # 提取时间
-        frame_num = extract_frame_number(name)
-        time_sec = frame_num if frame_num is not None else idx
-
-        results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
-
-        # 保存结果图片（带框）
-        if save_images and detected:
-            annotated_img = results[0].plot()
-            is_success, buffer = cv2.imencode(".jpg", annotated_img)
-            if is_success:
-                result_images[f"result_{time_sec:04d}_{name}"] = buffer.tobytes()
+    
+    for start in range(0, total, batch_size):
+        batch_items = items[start:start + batch_size]
+        batch_names = [name for name, _ in batch_items]
+        batch_imgs = []
         
-        # 保存原始帧图片（仅视频模式，且用户选择保存）
-        # 通过一个标记来判断是否需要保存原图，在视频处理中会设置这个标记
-        if hasattr(process_images, 'save_original_frames') and process_images.save_original_frames:
-            is_success, buffer = cv2.imencode(".jpg", img)
-            if is_success:
-                frame_images[f"frame_{time_sec:04d}.jpg"] = buffer.tobytes()
-
+        # 解码图片
+        for name, img_data in batch_items:
+            if isinstance(img_data, bytes):
+                nparr = np.frombuffer(img_data, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+            else:
+                img = img_data
+            batch_imgs.append(img)
+        
+        # 过滤掉解码失败的图片
+        valid_indices = [i for i, img in enumerate(batch_imgs) if img is not None]
+        valid_imgs = [batch_imgs[i] for i in valid_indices]
+        valid_names = [batch_names[i] for i in valid_indices]
+        
+        if not valid_imgs:
+            continue
+        
+        # ===== 批量推理 =====
+        results = model(valid_imgs, conf=conf_threshold)
+        
+        # 处理结果
+        for idx, (name, result) in enumerate(zip(valid_names, results)):
+            boxes = result.boxes
+            detected = []
+            if boxes is not None and len(boxes) > 0:
+                for box in boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
+                    x_center = float(box.xywh[0][0])
+                    detected.append((x_center, cls, conf))
+            
+            if not detected:
+                full_number = 'N/A'
+                avg_conf = 0.0
+            else:
+                detected.sort(key=lambda x: x[0])
+                digits = [str(d[1]) for d in detected]
+                confidences = [d[2] for d in detected]
+                full_number = ''.join(digits)
+                avg_conf = sum(confidences) / len(confidences)
+            
+            frame_num = extract_frame_number(name)
+            time_sec = frame_num if frame_num is not None else start + idx
+            results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
+            
+            if save_images and detected:
+                annotated_img = result.plot()
+                is_success, buffer = cv2.imencode(".jpg", annotated_img)
+                if is_success:
+                    result_images[f"result_{time_sec:04d}_{name}"] = buffer.tobytes()
+        
+        progress_bar.progress(min((start + batch_size) / total, 1.0))
+        status_text.text(f"已处理 {min(start + batch_size, total)}/{total} 张")
+    
     status_text.text("✅ 处理完成！")
     progress_bar.empty()
     return results_data, result_images, frame_images
-
+    
 def process_video(video_bytes, model, fps, save_images, save_frames, conf_threshold):
     """处理视频：流式抽帧 + 即时识别（内存友好）"""
     # 保存视频到临时文件
