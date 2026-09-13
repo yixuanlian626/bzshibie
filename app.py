@@ -14,11 +14,22 @@ from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 from pathlib import Path
 import pandas as pd
 from PIL import Image
+import hashlib
 
 # ========== 1. 页面配置 ==========
 st.set_page_config(page_title="数码管批量识别", layout="wide")
 st.title("📟 数码管数字批量识别工具")
 st.markdown("上传包含数码管图片的 **ZIP 压缩包** 或 **视频文件**，系统将自动识别所有图片中的数字组合并生成 CSV 结果。")
+
+# ========== 初始化 session_state ==========
+if 'results_data' not in st.session_state:
+    st.session_state.results_data = None
+if 'result_images' not in st.session_state:
+    st.session_state.result_images = {}
+if 'frame_images' not in st.session_state:
+    st.session_state.frame_images = {}
+if 'processed_file_hash' not in st.session_state:
+    st.session_state.processed_file_hash = None
 
 # ========== 2. 加载模型（使用缓存） ==========
 @st.cache_resource
@@ -42,7 +53,6 @@ if model is None:
 with st.sidebar:
     st.header("⚙️ 参数设置")
     
-    # 温度输入 - 四位有效数字，两位小数
     temperature = st.number_input(
         "🌡️ 温度 (摄氏度)",
         value=25.00,
@@ -51,25 +61,22 @@ with st.sidebar:
         help="输入当前实验温度（四位有效数字，两位小数），将用于CSV文件命名"
     )
     
-    # 输入源选择
     input_type = st.radio(
         "选择输入类型",
         ["📁 图片压缩包 (ZIP)", "🎬 视频文件"],
         index=0
     )
     
-    # 视频抽帧参数（仅在视频模式下显示）
     fps_choice = None
     if input_type == "🎬 视频文件":
         st.subheader("🎞️ 抽帧设置")
         fps_choice = st.selectbox(
             "抽帧频率 (每秒帧数)",
             options=[0.5, 1, 2, 5, 10, 15, 30],
-            index=1,  # 默认 1 fps
+            index=1,
             format_func=lambda x: f"{x} 帧/秒" if x != 0.5 else "每2秒1帧"
         )
     
-    # 通用参数
     save_images = st.checkbox("保存带检测框的结果图片", value=True)
     save_frames = st.checkbox("保存抽帧原图（仅视频模式）", value=True) if input_type == "🎬 视频文件" else False
     generate_plot = st.checkbox("生成电动势-时间平滑曲线图", value=True)
@@ -98,7 +105,6 @@ def process_images(image_files, model, save_images, conf_threshold, batch_size=8
     result_images = {}
     frame_images = {}
     
-    # 将图片字典转为列表
     items = list(image_files.items())
     total = len(items)
     
@@ -110,7 +116,6 @@ def process_images(image_files, model, save_images, conf_threshold, batch_size=8
         batch_names = [name for name, _ in batch_items]
         batch_imgs = []
         
-        # 解码图片
         for name, img_data in batch_items:
             if isinstance(img_data, bytes):
                 nparr = np.frombuffer(img_data, np.uint8)
@@ -119,7 +124,6 @@ def process_images(image_files, model, save_images, conf_threshold, batch_size=8
                 img = img_data
             batch_imgs.append(img)
         
-        # 过滤掉解码失败的图片
         valid_indices = [i for i, img in enumerate(batch_imgs) if img is not None]
         valid_imgs = [batch_imgs[i] for i in valid_indices]
         valid_names = [batch_names[i] for i in valid_indices]
@@ -127,10 +131,8 @@ def process_images(image_files, model, save_images, conf_threshold, batch_size=8
         if not valid_imgs:
             continue
         
-        # ===== 批量推理 =====
         results = model(valid_imgs, conf=conf_threshold)
         
-        # 处理结果
         for idx, (name, result) in enumerate(zip(valid_names, results)):
             boxes = result.boxes
             detected = []
@@ -167,10 +169,9 @@ def process_images(image_files, model, save_images, conf_threshold, batch_size=8
     status_text.text("✅ 处理完成！")
     progress_bar.empty()
     return results_data, result_images, frame_images
-    
+
 def process_video(video_bytes, model, fps, save_images, save_frames, conf_threshold):
     """处理视频：流式抽帧 + 即时识别（内存友好）"""
-    # 保存视频到临时文件
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         tmp_file.write(video_bytes)
         tmp_path = tmp_file.name
@@ -183,7 +184,6 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     if video_fps <= 0:
         video_fps = 25.0
     
-    # ===== 精确计数总帧数 =====
     precise_frame_count = 0
     while True:
         ret, _ = cap.read()
@@ -192,15 +192,12 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
         precise_frame_count += 1
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
     total_frames = precise_frame_count
-    # ==========================
     
-    # 计算抽帧间隔
     frame_interval = 1 if fps >= video_fps else int(video_fps / fps)
     
-    # ===== 结果存储（只存文本，不存图片） =====
     results_data = []
-    result_images = {}      # 只存用户要求保存的带框图片（少量）
-    frame_images = {}       # 只存用户要求保存的原始帧（少量）
+    result_images = {}
+    frame_images = {}
     
     frame_count = 0
     extracted_count = 0
@@ -208,7 +205,6 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     progress_bar = st.progress(0, text="正在抽帧并识别...")
     status_text = st.empty()
     
-    # 决定是否保存图片（只在用户勾选时才存）
     save_original_frames = save_frames
     save_result_images = save_images
     
@@ -217,16 +213,13 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
         if not ret:
             break
         
-        # 每隔 frame_interval 帧处理一帧
         if frame_count % frame_interval == 0:
             status_text.text(f"处理中: {frame_count}/{total_frames} (间隔 {frame_interval} 帧)")
             progress_bar.progress(frame_count / total_frames if total_frames > 0 else 0)
             
-            # 生成文件名和时间戳
             time_sec = int(frame_count / video_fps)
             filename = f"frame_{time_sec:04d}.jpg"
             
-            # ===== 立即识别这一帧 =====
             results = model(frame, conf=conf_threshold)
             boxes = results[0].boxes
             
@@ -251,15 +244,12 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
             results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
             extracted_count += 1
             
-            # ===== 只在用户勾选时才保存图片 =====
             if save_result_images and detected:
                 annotated_img = results[0].plot()
                 is_success, buffer = cv2.imencode(".jpg", annotated_img)
                 if is_success:
                     result_images[f"result_{time_sec:04d}.jpg"] = buffer.tobytes()
-                    # 限制保存图片数量，防止内存爆炸（最多保存200张）
                     if len(result_images) > 200:
-                        # 删除最早的图片（保持内存可控）
                         oldest_key = list(result_images.keys())[0]
                         del result_images[oldest_key]
             
@@ -267,7 +257,6 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
                 is_success, buffer = cv2.imencode(".jpg", frame)
                 if is_success:
                     frame_images[f"original_{time_sec:04d}.jpg"] = buffer.tobytes()
-                    # 同样限制数量
                     if len(frame_images) > 200:
                         oldest_key = list(frame_images.keys())[0]
                         del frame_images[oldest_key]
@@ -279,18 +268,12 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     
     st.info(f"📁 从视频中抽取并识别了 {extracted_count} 帧图片")
     
-    # 如果图片数量达到上限，给出提示
     if len(result_images) >= 200 or len(frame_images) >= 200:
         st.warning("⚠️ 为节省内存，结果图片仅保留最后200张。如需全部图片，请使用图片压缩包模式。")
     
     return results_data, result_images, frame_images
 
 # ========== 5. 主逻辑：根据输入类型分发 ==========
-results_data = None
-result_images = {}
-frame_images = {}
-image_files = {}  # 用于统计
-
 # ===== 5.1 图片压缩包模式 =====
 if input_type == "📁 图片压缩包 (ZIP)":
     uploaded_file = st.file_uploader(
@@ -300,30 +283,47 @@ if input_type == "📁 图片压缩包 (ZIP)":
     )
     
     if uploaded_file is not None:
-        with st.spinner("📦 正在解压 ZIP 文件..."):
-            image_files = {}
-            with zipfile.ZipFile(io.BytesIO(uploaded_file.read())) as zip_ref:
-                for file_info in zip_ref.infolist():
-                    if file_info.is_dir():
-                        continue
-                    ext = Path(file_info.filename).suffix.lower()
-                    if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-                        try:
-                            image_files[file_info.filename] = zip_ref.read(file_info.filename)
-                        except Exception as e:
-                            st.warning(f"无法读取文件: {file_info.filename}, 错误: {e}")
+        # 计算文件哈希，判断是否为新文件
+        file_bytes = uploaded_file.read()
+        file_hash = hashlib.md5(file_bytes).hexdigest()
         
-        if not image_files:
-            st.error("❌ ZIP 包中未找到任何支持的图片文件。")
-            st.stop()
-        
-        st.info(f"📁 共找到 {len(image_files)} 张图片")
-        
-        # 处理图片
-        process_images.save_original_frames = False  # 图片模式不额外保存原图
-        results_data, result_images, frame_images = process_images(
-            image_files, model, save_images, conf_threshold
-        )
+        # 只有当文件是新的（未处理过）时才重新识别
+        if file_hash != st.session_state.processed_file_hash:
+            with st.spinner("📦 正在解压 ZIP 文件..."):
+                image_files = {}
+                with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
+                    for file_info in zip_ref.infolist():
+                        if file_info.is_dir():
+                            continue
+                        ext = Path(file_info.filename).suffix.lower()
+                        if ext in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+                            try:
+                                image_files[file_info.filename] = zip_ref.read(file_info.filename)
+                            except Exception as e:
+                                st.warning(f"无法读取文件: {file_info.filename}, 错误: {e}")
+            
+            if not image_files:
+                st.error("❌ ZIP 包中未找到任何支持的图片文件。")
+                st.stop()
+            
+            st.info(f"📁 共找到 {len(image_files)} 张图片")
+            
+            process_images.save_original_frames = False
+            results_data, result_images, frame_images = process_images(
+                image_files, model, save_images, conf_threshold
+            )
+            
+            # 将结果存入 session_state
+            st.session_state.results_data = results_data
+            st.session_state.result_images = result_images
+            st.session_state.frame_images = frame_images
+            st.session_state.processed_file_hash = file_hash
+        else:
+            # 文件已处理过，直接使用缓存结果
+            st.info("📁 使用已缓存的识别结果（点击下载不会重新识别）")
+            results_data = st.session_state.results_data
+            result_images = st.session_state.result_images
+            frame_images = st.session_state.frame_images
 
 # ===== 5.2 视频模式 =====
 else:
@@ -334,22 +334,40 @@ else:
     )
     
     if uploaded_video is not None:
-        try:
-            results_data, result_images, frame_images = process_video(
-                uploaded_video.read(),
-                model,
-                fps_choice,
-                save_images,
-                save_frames,
-                conf_threshold
-            )
-        except Exception as e:
-            st.error(f"❌ 处理视频时出错: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-            st.stop()
+        video_bytes = uploaded_video.read()
+        file_hash = hashlib.md5(video_bytes).hexdigest()
+        
+        if file_hash != st.session_state.processed_file_hash:
+            try:
+                results_data, result_images, frame_images = process_video(
+                    video_bytes,
+                    model,
+                    fps_choice,
+                    save_images,
+                    save_frames,
+                    conf_threshold
+                )
+                
+                st.session_state.results_data = results_data
+                st.session_state.result_images = result_images
+                st.session_state.frame_images = frame_images
+                st.session_state.processed_file_hash = file_hash
+            except Exception as e:
+                st.error(f"❌ 处理视频时出错: {e}")
+                import traceback
+                st.code(traceback.format_exc())
+                st.stop()
+        else:
+            st.info("🎬 使用已缓存的识别结果（点击下载不会重新识别）")
+            results_data = st.session_state.results_data
+            result_images = st.session_state.result_images
+            frame_images = st.session_state.frame_images
 
 # ========== 6. 显示与下载结果 ==========
+results_data = st.session_state.results_data
+result_images = st.session_state.result_images
+frame_images = st.session_state.frame_images
+
 if results_data:
     if not results_data:
         st.error("❌ 未能识别出任何有效数据。")
@@ -360,7 +378,6 @@ if results_data:
     df = pd.DataFrame(results_data, columns=['Time (s)', 'EMF (mV)', 'Confidence'])
     st.dataframe(df.head(20), use_container_width=True)
     
-    # 统计信息
     valid_count = len([r for r in results_data if r[1] != 'N/A'])
     st.caption(f"有效识别: {valid_count} / {len(results_data)} 张")
     
@@ -382,7 +399,6 @@ if results_data:
                 emfs_sorted = emfs[sort_idx]
                 confs_sorted = confs[sort_idx]
                 
-                # 过滤异常值
                 filter_mask = (emfs_sorted >= 100) & (emfs_sorted <= 1000)
                 times_plot = times_sorted[filter_mask]
                 emfs_plot = emfs_sorted[filter_mask]
@@ -390,7 +406,6 @@ if results_data:
                 
                 if len(times_plot) >= 4:
                     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
-                    # 图1：原始数据点
                     scatter = ax1.scatter(times_plot, emfs_plot, c=confs_plot, cmap='viridis', s=20, alpha=0.6)
                     ax1.plot(times_plot, emfs_plot, 'b--', alpha=0.3)
                     ax1.set_xlabel('Time (s)')
@@ -399,7 +414,6 @@ if results_data:
                     ax1.grid(True, alpha=0.3)
                     plt.colorbar(scatter, ax=ax1, label='Confidence')
                     
-                    # 图2：平滑曲线
                     x_smooth = np.linspace(times_plot.min(), times_plot.max(), 300)
                     spl = make_interp_spline(times_plot, emfs_plot, k=min(3, len(times_plot)-1))
                     y_smooth = spl(x_smooth)
@@ -422,7 +436,6 @@ if results_data:
     # ===== 6.3 下载结果 =====
     st.subheader("📥 下载结果")
     
-    # 生成带温度的CSV文件名 - 只包含温度数值
     temp_str = f"{temperature:.2f}"
     csv_filename = f"{temp_str}.csv"
     
@@ -447,7 +460,6 @@ if results_data:
             with zipfile.ZipFile(zip_buffer, 'w') as zip_out:
                 for fname, data in result_images.items():
                     zip_out.writestr(fname, data)
-            # 结果图片ZIP也包含温度信息
             zip_filename = f"{temp_str}.zip"
             st.download_button(
                 label="🖼️ 下载结果图片 (ZIP)",
@@ -465,7 +477,6 @@ if results_data:
             with zipfile.ZipFile(zip_buffer, 'w') as zip_out:
                 for fname, data in frame_images.items():
                     zip_out.writestr(fname, data)
-            # 抽帧原图ZIP也包含温度信息
             zip_filename = f"frames_{temp_str}.zip"
             st.download_button(
                 label="🖼️ 下载抽帧原图 (ZIP)",
