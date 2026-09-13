@@ -10,10 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from scipy.interpolate import make_interp_spline
 import re
-from matplotlib.ticker import MultipleLocator, FormatStrFormatter
 from pathlib import Path
 import pandas as pd
-from PIL import Image
 import hashlib
 
 # ========== 1. 页面配置 ==========
@@ -22,10 +20,8 @@ st.title("📟 数码管数字批量识别工具")
 st.markdown("上传包含数码管图片的 **ZIP 压缩包** 或 **视频文件**，系统将自动识别所有图片中的数字组合并生成 CSV 结果。")
 
 # ========== 初始化 session_state ==========
-if 'results_data' not in st.session_state:
-    st.session_state.results_data = None
-if 'result_images' not in st.session_state:
-    st.session_state.result_images = {}
+if 'raw_results_data' not in st.session_state:
+    st.session_state.raw_results_data = None
 if 'frame_images' not in st.session_state:
     st.session_state.frame_images = {}
 if 'processed_file_hash' not in st.session_state:
@@ -77,10 +73,24 @@ with st.sidebar:
             format_func=lambda x: f"{x} 帧/秒" if x != 0.5 else "每2秒1帧"
         )
     
-    save_images = st.checkbox("保存带检测框的结果图片", value=True)
     save_frames = st.checkbox("保存抽帧原图（仅视频模式）", value=True) if input_type == "🎬 视频文件" else False
     generate_plot = st.checkbox("生成电动势-时间平滑曲线图", value=True)
-    conf_threshold = st.slider("置信度阈值", 0.0, 1.0, 0.25, 0.05)
+    
+    st.subheader("🎯 置信度设置")
+    conf_threshold = st.slider(
+        "模型推理置信度阈值",
+        0.0, 1.0, 0.25, 0.05,
+        help="传给YOLO模型的置信度，控制模型输出哪些检测框"
+    )
+    filter_conf_threshold = st.number_input(
+        "结果筛选置信度阈值",
+        value=0.50,
+        min_value=0.0,
+        max_value=1.0,
+        step=0.05,
+        format="%.2f",
+        help="在模型输出结果上再筛选：只保留置信度 >= 该值的检测结果，低于此值的结果将被剔除"
+    )
 
 # ========== 4. 核心处理函数 ==========
 def extract_frame_number(filename):
@@ -99,11 +109,12 @@ def extract_frame_number(filename):
             return int(match.group(1))
     return None
 
-def process_images(image_files, model, save_images, conf_threshold, batch_size=8):
-    """处理图片列表（批量推理版）"""
-    results_data = []
-    result_images = {}
-    frame_images = {}
+def process_images(image_files, model, conf_threshold, batch_size=8):
+    """处理图片列表（批量推理版）
+    返回 raw_results_data: [(time_sec, raw_detections), ...]
+    raw_detections: [(x_center, cls, conf), ...]
+    """
+    raw_results_data = []
     
     items = list(image_files.items())
     total = len(items)
@@ -143,35 +154,22 @@ def process_images(image_files, model, save_images, conf_threshold, batch_size=8
                     x_center = float(box.xywh[0][0])
                     detected.append((x_center, cls, conf))
             
-            if not detected:
-                full_number = 'N/A'
-                avg_conf = 0.0
-            else:
-                detected.sort(key=lambda x: x[0])
-                digits = [str(d[1]) for d in detected]
-                confidences = [d[2] for d in detected]
-                full_number = ''.join(digits)
-                avg_conf = sum(confidences) / len(confidences)
-            
             frame_num = extract_frame_number(name)
             time_sec = frame_num if frame_num is not None else start + idx
-            results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
-            
-            if save_images and detected:
-                annotated_img = result.plot()
-                is_success, buffer = cv2.imencode(".jpg", annotated_img)
-                if is_success:
-                    result_images[f"result_{time_sec:04d}_{name}"] = buffer.tobytes()
+            # 保存原始检测列表（未筛选）
+            raw_results_data.append((time_sec, detected))
         
         progress_bar.progress(min((start + batch_size) / total, 1.0))
         status_text.text(f"已处理 {min(start + batch_size, total)}/{total} 张")
     
     status_text.text("✅ 处理完成！")
     progress_bar.empty()
-    return results_data, result_images, frame_images
+    return raw_results_data
 
-def process_video(video_bytes, model, fps, save_images, save_frames, conf_threshold):
-    """处理视频：流式抽帧 + 即时识别（内存友好）"""
+def process_video(video_bytes, model, fps, save_frames, conf_threshold):
+    """处理视频：流式抽帧 + 即时识别（内存友好）
+    返回 raw_results_data 和 frame_images
+    """
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         tmp_file.write(video_bytes)
         tmp_path = tmp_file.name
@@ -195,8 +193,7 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     
     frame_interval = 1 if fps >= video_fps else int(video_fps / fps)
     
-    results_data = []
-    result_images = {}
+    raw_results_data = []
     frame_images = {}
     
     frame_count = 0
@@ -204,9 +201,6 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     
     progress_bar = st.progress(0, text="正在抽帧并识别...")
     status_text = st.empty()
-    
-    save_original_frames = save_frames
-    save_result_images = save_images
     
     while True:
         ret, frame = cap.read()
@@ -218,7 +212,6 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
             progress_bar.progress(frame_count / total_frames if total_frames > 0 else 0)
             
             time_sec = int(frame_count / video_fps)
-            filename = f"frame_{time_sec:04d}.jpg"
             
             results = model(frame, conf=conf_threshold)
             boxes = results[0].boxes
@@ -231,29 +224,10 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
                     x_center = float(box.xywh[0][0])
                     detected.append((x_center, cls, conf))
             
-            if not detected:
-                full_number = 'N/A'
-                avg_conf = 0.0
-            else:
-                detected.sort(key=lambda x: x[0])
-                digits = [str(d[1]) for d in detected]
-                confidences = [d[2] for d in detected]
-                full_number = ''.join(digits)
-                avg_conf = sum(confidences) / len(confidences)
-            
-            results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
+            raw_results_data.append((time_sec, detected))
             extracted_count += 1
             
-            if save_result_images and detected:
-                annotated_img = results[0].plot()
-                is_success, buffer = cv2.imencode(".jpg", annotated_img)
-                if is_success:
-                    result_images[f"result_{time_sec:04d}.jpg"] = buffer.tobytes()
-                    if len(result_images) > 200:
-                        oldest_key = list(result_images.keys())[0]
-                        del result_images[oldest_key]
-            
-            if save_original_frames:
+            if save_frames:
                 is_success, buffer = cv2.imencode(".jpg", frame)
                 if is_success:
                     frame_images[f"original_{time_sec:04d}.jpg"] = buffer.tobytes()
@@ -268,10 +242,31 @@ def process_video(video_bytes, model, fps, save_images, save_frames, conf_thresh
     
     st.info(f"📁 从视频中抽取并识别了 {extracted_count} 帧图片")
     
-    if len(result_images) >= 200 or len(frame_images) >= 200:
-        st.warning("⚠️ 为节省内存，结果图片仅保留最后200张。如需全部图片，请使用图片压缩包模式。")
+    if len(frame_images) >= 200:
+        st.warning("⚠️ 为节省内存，抽帧原图仅保留最后200张。如需全部图片，请使用图片压缩包模式。")
     
-    return results_data, result_images, frame_images
+    return raw_results_data, frame_images
+
+def apply_filter(raw_results_data, filter_conf_threshold):
+    """按筛选置信度阈值重新计算识别结果
+    返回 results_data: [[time_sec, full_number, avg_conf], ...]
+    """
+    results_data = []
+    for time_sec, raw_detections in raw_results_data:
+        filtered = [d for d in raw_detections if d[2] >= filter_conf_threshold]
+        
+        if not filtered:
+            full_number = 'N/A'
+            avg_conf = 0.0
+        else:
+            filtered.sort(key=lambda x: x[0])
+            digits = [str(d[1]) for d in filtered]
+            confidences = [d[2] for d in filtered]
+            full_number = ''.join(digits)
+            avg_conf = sum(confidences) / len(confidences)
+        
+        results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
+    return results_data
 
 # ========== 5. 主逻辑：根据输入类型分发 ==========
 # ===== 5.1 图片压缩包模式 =====
@@ -283,11 +278,9 @@ if input_type == "📁 图片压缩包 (ZIP)":
     )
     
     if uploaded_file is not None:
-        # 计算文件哈希，判断是否为新文件
         file_bytes = uploaded_file.read()
         file_hash = hashlib.md5(file_bytes).hexdigest()
         
-        # 只有当文件是新的（未处理过）时才重新识别
         if file_hash != st.session_state.processed_file_hash:
             with st.spinner("📦 正在解压 ZIP 文件..."):
                 image_files = {}
@@ -308,22 +301,13 @@ if input_type == "📁 图片压缩包 (ZIP)":
             
             st.info(f"📁 共找到 {len(image_files)} 张图片")
             
-            process_images.save_original_frames = False
-            results_data, result_images, frame_images = process_images(
-                image_files, model, save_images, conf_threshold
-            )
+            raw_results_data = process_images(image_files, model, conf_threshold)
             
-            # 将结果存入 session_state
-            st.session_state.results_data = results_data
-            st.session_state.result_images = result_images
-            st.session_state.frame_images = frame_images
+            st.session_state.raw_results_data = raw_results_data
+            st.session_state.frame_images = {}
             st.session_state.processed_file_hash = file_hash
         else:
-            # 文件已处理过，直接使用缓存结果
-            st.info("📁 使用已缓存的识别结果（点击下载不会重新识别）")
-            results_data = st.session_state.results_data
-            result_images = st.session_state.result_images
-            frame_images = st.session_state.frame_images
+            st.info("📁 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
 # ===== 5.2 视频模式 =====
 else:
@@ -339,17 +323,11 @@ else:
         
         if file_hash != st.session_state.processed_file_hash:
             try:
-                results_data, result_images, frame_images = process_video(
-                    video_bytes,
-                    model,
-                    fps_choice,
-                    save_images,
-                    save_frames,
-                    conf_threshold
+                raw_results_data, frame_images = process_video(
+                    video_bytes, model, fps_choice, save_frames, conf_threshold
                 )
                 
-                st.session_state.results_data = results_data
-                st.session_state.result_images = result_images
+                st.session_state.raw_results_data = raw_results_data
                 st.session_state.frame_images = frame_images
                 st.session_state.processed_file_hash = file_hash
             except Exception as e:
@@ -358,23 +336,23 @@ else:
                 st.code(traceback.format_exc())
                 st.stop()
         else:
-            st.info("🎬 使用已缓存的识别结果（点击下载不会重新识别）")
-            results_data = st.session_state.results_data
-            result_images = st.session_state.result_images
-            frame_images = st.session_state.frame_images
+            st.info("🎬 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
 # ========== 6. 显示与下载结果 ==========
-results_data = st.session_state.results_data
-result_images = st.session_state.result_images
+raw_results_data = st.session_state.raw_results_data
 frame_images = st.session_state.frame_images
 
-if results_data:
+if raw_results_data:
+    # 按筛选置信度阈值重新计算
+    results_data = apply_filter(raw_results_data, filter_conf_threshold)
+    
     if not results_data:
         st.error("❌ 未能识别出任何有效数据。")
         st.stop()
     
     # ===== 6.1 显示结果预览 =====
     st.subheader("📊 识别结果预览")
+    st.caption(f"当前筛选置信度阈值: {filter_conf_threshold:.2f}（低于此值的检测结果已被剔除）")
     df = pd.DataFrame(results_data, columns=['Time (s)', 'EMF (mV)', 'Confidence'])
     st.dataframe(df.head(20), use_container_width=True)
     
@@ -437,9 +415,10 @@ if results_data:
     st.subheader("📥 下载结果")
     
     temp_str = f"{temperature:.2f}"
-    csv_filename = f"{temp_str}.csv"
+    conf_str = f"{filter_conf_threshold:.2f}"
+    csv_filename = f"{temp_str}_conf{conf_str}.csv"
     
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
     
     with col1:
         csv_buffer = io.StringIO()
@@ -455,23 +434,6 @@ if results_data:
         )
     
     with col2:
-        if result_images:
-            zip_buffer = io.BytesIO()
-            with zipfile.ZipFile(zip_buffer, 'w') as zip_out:
-                for fname, data in result_images.items():
-                    zip_out.writestr(fname, data)
-            zip_filename = f"{temp_str}.zip"
-            st.download_button(
-                label="🖼️ 下载结果图片 (ZIP)",
-                data=zip_buffer.getvalue(),
-                file_name=zip_filename,
-                mime="application/zip",
-                use_container_width=True
-            )
-        else:
-            st.button("🖼️ 下载结果图片 (无)", disabled=True, use_container_width=True)
-    
-    with col3:
         if frame_images:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w') as zip_out:
