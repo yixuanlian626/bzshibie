@@ -4,6 +4,7 @@ import cv2
 import os
 import csv
 import io
+import gc
 import zipfile
 import tempfile
 import matplotlib.pyplot as plt
@@ -73,15 +74,20 @@ with st.sidebar:
             format_func=lambda x: f"{x} 帧/秒" if x != 0.5 else "每2秒1帧"
         )
     
-    save_frames = st.checkbox("保存抽帧原图（仅视频模式）", value=True) if input_type == "🎬 视频文件" else False
+    save_frames = st.checkbox(
+        "保存抽帧原图（仅视频模式）",
+        value=False,
+        help="开启后会占用较多内存，建议仅在需要时开启"
+    ) if input_type == "🎬 视频文件" else False
+    
     generate_plot = st.checkbox("生成电动势-时间平滑曲线图", value=True)
     
     st.subheader("⚡ 性能设置")
     batch_size = st.selectbox(
         "批处理大小",
-        options=[8, 16, 32, 64],
+        options=[2, 4, 8, 16],
         index=1,
-        help="越大越快，但内存占用越高。1920×1080 JPEG 建议 16~32"
+        help="内存不足时选小值。默认 4，内存充足可调到 8 或 16 提速"
     )
     use_half_res = st.checkbox(
         "半分辨率解码（加速）",
@@ -128,15 +134,15 @@ def extract_frame_number(filename):
             return int(match.group(1))
     return None
 
-def process_zip_streaming(file_bytes, model, conf_threshold,
-                          batch_size=16, use_half_res=True, imgsz=640):
-    """流式从 ZIP 读取图片并批量推理，内存只驻留一个 batch。
+def process_zip_streaming(zip_path, model, conf_threshold,
+                          batch_size=4, use_half_res=True, imgsz=640):
+    """流式从 ZIP 文件读取图片并批量推理，内存只驻留一个 batch。
+    zip_path: ZIP 文件的本地路径（临时文件）
     返回 raw_results_data: [(time_sec, raw_detections), ...]
-    raw_detections: [(x_center, cls, conf), ...]
     """
     raw_results_data = []
     
-    with zipfile.ZipFile(io.BytesIO(file_bytes)) as zip_ref:
+    with zipfile.ZipFile(zip_path) as zip_ref:
         image_infos = [
             info for info in zip_ref.infolist()
             if not info.is_dir() and Path(info.filename).suffix.lower()
@@ -162,6 +168,7 @@ def process_zip_streaming(file_bytes, model, conf_threshold,
                 img_bytes = zip_ref.read(info.filename)
                 nparr = np.frombuffer(img_bytes, np.uint8)
                 img = cv2.imdecode(nparr, decode_flag)
+                del img_bytes, nparr
             except Exception:
                 img = None
             
@@ -195,9 +202,13 @@ def process_zip_streaming(file_bytes, model, conf_threshold,
                         raw_results_data.append((time_sec, detected))
                         processed_count += 1
                     
+                    # 显式释放
+                    for im in batch_imgs:
+                        del im
                     del batch_imgs, results
                     batch_names = []
                     batch_imgs = []
+                    gc.collect()
                 
                 progress_bar.progress(min(global_idx / total, 1.0))
                 status_text.text(f"已处理 {global_idx}/{total} 张")
@@ -208,7 +219,7 @@ def process_zip_streaming(file_bytes, model, conf_threshold,
     return raw_results_data
 
 def process_video(video_bytes, model, fps, save_frames, conf_threshold,
-                  batch_size=16, imgsz=640):
+                  batch_size=4, imgsz=640):
     """处理视频：流式抽帧 + 批量识别"""
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         tmp_file.write(video_bytes)
@@ -263,6 +274,7 @@ def process_video(video_bytes, model, fps, save_frames, conf_threshold,
             extracted_count += 1
         batch_frames.clear()
         batch_times.clear()
+        gc.collect()
     
     while True:
         ret, frame = cap.read()
@@ -310,18 +322,14 @@ def apply_filter(raw_results_data, filter_conf_threshold):
     results_data = []
     for time_sec, raw_detections in raw_results_data:
         if not raw_detections:
-            # 该图片没有检测到任何数字，直接跳过（不写入CSV）
             continue
         
-        # 计算这张图所有检测数字的平均置信度
         confidences = [d[2] for d in raw_detections]
         avg_conf = sum(confidences) / len(confidences)
         
-        # 平均置信度低于阈值 → 整行删除
         if avg_conf < filter_conf_threshold:
             continue
         
-        # 保留该图片的完整识别结果（所有数字都保留，不剔除单个数字）
         raw_detections_sorted = sorted(raw_detections, key=lambda x: x[0])
         digits = [str(d[1]) for d in raw_detections_sorted]
         full_number = ''.join(digits)
@@ -340,17 +348,33 @@ if input_type == "📁 图片压缩包 (ZIP)":
     )
     
     if uploaded_file is not None:
-        file_bytes = uploaded_file.read()
-        file_hash = hashlib.md5(file_bytes).hexdigest()
+        # 将上传的 ZIP 写入临时文件，避免全部读进内存
+        with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_zip:
+            tmp_zip.write(uploaded_file.getbuffer())
+            tmp_zip_path = tmp_zip.name
+        
+        # 计算哈希（分块读取，避免一次性加载大文件）
+        hasher = hashlib.md5()
+        with open(tmp_zip_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                hasher.update(chunk)
+        file_hash = hasher.hexdigest()
         
         if file_hash != st.session_state.processed_file_hash:
             st.info("📦 正在流式解压并识别...")
-            raw_results_data = process_zip_streaming(
-                file_bytes, model, conf_threshold,
-                batch_size=batch_size,
-                use_half_res=use_half_res,
-                imgsz=imgsz
-            )
+            try:
+                raw_results_data = process_zip_streaming(
+                    tmp_zip_path, model, conf_threshold,
+                    batch_size=batch_size,
+                    use_half_res=use_half_res,
+                    imgsz=imgsz
+                )
+            finally:
+                # 用完删除临时文件
+                try:
+                    os.unlink(tmp_zip_path)
+                except Exception:
+                    pass
             
             if not raw_results_data:
                 st.error("❌ ZIP 包中未找到任何可处理的图片。")
@@ -360,6 +384,11 @@ if input_type == "📁 图片压缩包 (ZIP)":
             st.session_state.frame_images = {}
             st.session_state.processed_file_hash = file_hash
         else:
+            # 已处理过，删除临时文件
+            try:
+                os.unlink(tmp_zip_path)
+            except Exception:
+                pass
             st.info("📁 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
 # ===== 5.2 视频模式 =====
@@ -389,6 +418,9 @@ else:
                 import traceback
                 st.code(traceback.format_exc())
                 st.stop()
+            finally:
+                del video_bytes
+                gc.collect()
         else:
             st.info("🎬 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
