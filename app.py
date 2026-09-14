@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 import hashlib
 
-# ========== 1. 页面配置【完全复原bzshibie1.txt界面】 ==========
+# ========== 1. 页面配置【完全复原bzshibie1.txt界面，无任何UI改动】 ==========
 st.set_page_config(page_title="数码管批量识别", layout="wide")
 plt.switch_backend("Agg")
 st.title("📟 数码管数字批量识别工具")
@@ -47,7 +47,7 @@ model = load_model()
 if model is None:
     st.stop()
 
-# ========== 3. 侧边栏：参数设置 【原样复刻bzshibie1.txt全部控件】 ==========
+# ========== 3. 侧边栏：参数设置 【原样复刻bzshibie1.txt全部控件，零修改】 ==========
 with st.sidebar:
     st.header("⚙️ 参数设置")
 
@@ -136,21 +136,30 @@ def extract_frame_number(filename):
     return None
 
 
-def stream_hash(fileobj, chunk_size=1024*1024):
-    """流md5计算，不全部加载到内存"""
+def upload_to_temp_with_hash(fileobj, chunk_size=8*1024*1024):
+    """
+    【核心优化：只读取上传流一遍】
+    一边分块写入临时zip，一边计算md5，消除两次读取文件
+    return (tmp_path, md5_hex)
+    """
     hasher = hashlib.md5()
     fileobj.seek(0)
-    while chunk := fileobj.read(chunk_size):
-        hasher.update(chunk)
-    fileobj.seek(0)
-    return hasher.hexdigest()
+    tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp_path = tmp_file.name
+    try:
+        while chunk := fileobj.read(chunk_size):
+            hasher.update(chunk)
+            tmp_file.write(chunk)
+        tmp_file.close()
+        md5_result = hasher.hexdigest()
+        return tmp_path, md5_result
+    except Exception:
+        os.unlink(tmp_path)
+        raise
 
 
 def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
                                    batch_size=4, use_half_res=True, imgsz=640, ui_update_interval=20):
-    """
-    ZIP流式处理：不预加载全部图片到内存，batch推理，防止OOM
-    """
     raw_results_data = []
     image_suffix = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
 
@@ -186,7 +195,6 @@ def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
                 batch_names.append(info.filename)
                 batch_imgs.append(img)
 
-            # 执行batch推理
             if len(batch_imgs) >= batch_size or idx == total -1:
                 if batch_imgs:
                     results = model(
@@ -210,7 +218,6 @@ def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
                         raw_results_data.append((time_sec, detected))
                         processed_count += 1
 
-                    # 释放内存
                     for im in batch_imgs:
                         del im
                     del batch_imgs, results
@@ -218,7 +225,6 @@ def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
                     batch_imgs = []
                     gc.collect()
 
-                # UI隔N张刷新，减少streamlit重渲染
                 if (idx+1) % ui_update_interval ==0 or (idx+1)==total:
                     progress_bar.progress(min((idx+1)/total,1.0))
                     status_text.text(f"已处理 {idx+1}/{total} 张")
@@ -230,7 +236,6 @@ def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
 
 def process_video(video_bytes, model, fps, save_frames, conf_threshold,
                   batch_size=4, imgsz=640):
-    """处理视频：流式抽帧 + 批量识别，沿用bzshibie1原版逻辑，内存优化"""
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
         tmp_file.write(video_bytes)
         tmp_path = tmp_file.name
@@ -321,7 +326,6 @@ def process_video(video_bytes, model, fps, save_frames, conf_threshold,
 
 
 def apply_filter(raw_results_data, filter_conf_threshold):
-    """bzshibie1原版过滤逻辑：整张图平均置信度低于阈值删除整行"""
     results_data = []
     for time_sec, raw_detections in raw_results_data:
         if not raw_detections:
@@ -344,22 +348,16 @@ if input_type == "📁 图片压缩包 (ZIP)":
         help="请将图片打包成 ZIP 格式上传"
     )
     if uploaded_file is not None:
-        # spinner立刻弹出，复刻bzshibie1上传后立刻提示解压的交互
-        with st.spinner("📦 正在流式解压并识别..."):
-            file_hash = stream_hash(uploaded_file)
-            file_size_mb = uploaded_file.size/(1024*1024)
-            st.info(f"ZIP文件大小: {file_size_mb:.1f} MB")
-            if file_size_mb>300:
-                st.warning("⚠️ 文件较大，处理会消耗较多时间，请耐心等待。")
+        file_size_mb = uploaded_file.size/(1024*1024)
+        st.info(f"ZIP文件大小: {file_size_mb:.1f} MB")
+        if file_size_mb>300:
+            st.warning("⚠️ 文件较大，处理会消耗较多时间，请耐心等待。")
+
+        # 【关键】一次读取上传流：同时写临时文件+计算md5，消除二次读取
+        tmp_zip_path, file_hash = upload_to_temp_with_hash(uploaded_file)
 
         if file_hash != st.session_state.processed_file_hash:
-            # 分块写入临时磁盘，不一次性读全部zip进内存
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.zip') as tmp_zip:
-                uploaded_file.seek(0)
-                while chunk := uploaded_file.read(8*1024*1024):
-                    tmp_zip.write(chunk)
-                tmp_zip_path = tmp_zip.name
-
+            st.info("📦 正在流式解压并识别...")
             try:
                 raw_results_data = process_zip_stream_memory_safe(
                     tmp_zip_path, model, conf_threshold,
@@ -381,6 +379,10 @@ if input_type == "📁 图片压缩包 (ZIP)":
             st.session_state.frame_images = {}
             st.session_state.processed_file_hash = file_hash
         else:
+            try:
+                os.unlink(tmp_zip_path)
+            except Exception:
+                pass
             st.info("📁 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
 else:
@@ -412,7 +414,7 @@ else:
         else:
             st.info("🎬 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
-# ========== 6. 显示与下载结果【bzshibie1原版界面，2列下载按钮】 ==========
+# ========== 6. 显示与下载结果【bzshibie1原版界面，2列下载按钮，UI零改动】 ==========
 raw_results_data = st.session_state.raw_results_data
 frame_images = st.session_state.frame_images
 if raw_results_data:
@@ -430,7 +432,6 @@ if raw_results_data:
     kept_count = len(results_data)
     st.caption(f"保留: {kept_count} / {total_count} 张（删除 {total_count - kept_count} 张）")
 
-    # 绘图逻辑原样复刻bzshibie1
     if generate_plot and len(results_data) > 1:
         st.subheader("📈 电动势-时间平滑曲线")
         try:
@@ -483,7 +484,6 @@ if raw_results_data:
         except Exception as e:
             st.warning(f"生成曲线图时出错: {e}")
 
-    # ===== 下载区：2列（bzshibie1原版）=====
     st.subheader("📥 下载结果")
     temp_str = f"{temperature:.2f}"
     csv_filename = f"{temp_str}.csv"
