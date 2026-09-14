@@ -15,7 +15,7 @@ from pathlib import Path
 import pandas as pd
 import hashlib
 
-# ========== 1. 页面配置【完全复原bzshibie1.txt界面，无任何UI改动】 ==========
+# ========== 页面配置【完全复原bzshibie1.txt界面，UI零改动】 ==========
 st.set_page_config(page_title="数码管批量识别", layout="wide")
 plt.switch_backend("Agg")
 st.title("📟 数码管数字批量识别工具")
@@ -29,7 +29,10 @@ if 'frame_images' not in st.session_state:
 if 'processed_file_hash' not in st.session_state:
     st.session_state.processed_file_hash = None
 
-# ========== 2. 加载模型（使用缓存） ==========
+# 自适应切换阈值：你的最大压缩包387269KB ≈378.2MB；设置420MB，大于现有最大包；超过该值自动落盘磁盘防OOM
+SIZE_THRESHOLD = 420 * 1024 * 1024
+
+# ========== 加载模型 ==========
 @st.cache_resource
 def load_model():
     model_path = "best.pt"
@@ -47,7 +50,7 @@ model = load_model()
 if model is None:
     st.stop()
 
-# ========== 3. 侧边栏：参数设置 【原样复刻bzshibie1.txt全部控件，零修改】 ==========
+# ========== 侧边栏【原样复刻bzshibie1，无任何UI改动】 ==========
 with st.sidebar:
     st.header("⚙️ 参数设置")
 
@@ -118,9 +121,8 @@ with st.sidebar:
         help="对每张图片：计算所有检测数字的平均置信度，若平均置信度 < 该值，则整行删除；否则保留全部数字"
     )
 
-# ========== 4. 工具函数 ==========
+# ========== 工具函数 ==========
 def extract_frame_number(filename):
-    """从文件名中提取帧序号"""
     patterns = [
         r'(\d+)',
         r'frame[_\s-]?(\d+)',
@@ -136,12 +138,18 @@ def extract_frame_number(filename):
     return None
 
 
+def calc_md5_from_fileobj(fileobj, chunk_size=8*1024*1024):
+    """流读取对象计算md5，读取后seek归零"""
+    hasher = hashlib.md5()
+    fileobj.seek(0)
+    while chunk := fileobj.read(chunk_size):
+        hasher.update(chunk)
+    fileobj.seek(0)
+    return hasher.hexdigest()
+
+
 def upload_to_temp_with_hash(fileobj, chunk_size=8*1024*1024):
-    """
-    【核心优化：只读取上传流一遍】
-    一边分块写入临时zip，一边计算md5，消除两次读取文件
-    return (tmp_path, md5_hex)
-    """
+    """大文件路径：写入磁盘临时zip同时计算md5"""
     hasher = hashlib.md5()
     fileobj.seek(0)
     tmp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
@@ -158,11 +166,78 @@ def upload_to_temp_with_hash(fileobj, chunk_size=8*1024*1024):
         raise
 
 
-def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
-                                   batch_size=4, use_half_res=True, imgsz=640, ui_update_interval=20):
+def process_zip_memory(zip_bytes_io, model, conf_threshold,
+                       batch_size=4, use_half_res=True, imgsz=640, ui_update_interval=20):
+    """小文件路径：纯内存BytesIO，不写磁盘，速度快"""
     raw_results_data = []
     image_suffix = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
+    with zipfile.ZipFile(zip_bytes_io) as zip_ref:
+        image_infos = []
+        for info in zip_ref.infolist():
+            if not info.is_dir() and Path(info.filename).suffix.lower() in image_suffix:
+                image_infos.append(info)
+        total = len(image_infos)
+        if total == 0:
+            return raw_results_data
 
+        progress_bar = st.progress(0, text="开始处理...")
+        status_text = st.empty()
+
+        batch_names = []
+        batch_imgs = []
+        processed_count = 0
+
+        for idx, info in enumerate(image_infos):
+            try:
+                img_bytes = zip_ref.read(info.filename)
+                nparr = np.frombuffer(img_bytes, np.uint8)
+                img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                del img_bytes, nparr
+            except Exception:
+                img = None
+
+            if img is not None:
+                if use_half_res:
+                    h, w = img.shape[:2]
+                    img = cv2.resize(img, (w//2, h//2), interpolation=cv2.INTER_AREA)
+                batch_names.append(info.filename)
+                batch_imgs.append(img)
+
+            if len(batch_imgs) >= batch_size or idx == total - 1:
+                if batch_imgs:
+                    results = model(batch_imgs, conf=conf_threshold, imgsz=imgsz, verbose=False)
+                    for name, result in zip(batch_names, results):
+                        boxes = result.boxes
+                        detected = []
+                        if boxes is not None and len(boxes) > 0:
+                            for box in boxes:
+                                cls = int(box.cls[0])
+                                conf = float(box.conf[0])
+                                x_center = float(box.xywh[0][0])
+                                detected.append((x_center, cls, conf))
+                        frame_num = extract_frame_number(name)
+                        time_sec = frame_num if frame_num is not None else processed_count
+                        raw_results_data.append((time_sec, detected))
+                        processed_count += 1
+                    for im in batch_imgs:
+                        del im
+                    del batch_imgs, results
+                    batch_names = []
+                    batch_imgs = []
+                    gc.collect()
+                if (idx+1) % ui_update_interval == 0 or (idx+1) == total:
+                    progress_bar.progress(min((idx+1)/total,1.0))
+                    status_text.text(f"已处理 {idx+1}/{total} 张")
+        status_text.text("✅ 处理完成！")
+        progress_bar.empty()
+    return raw_results_data
+
+
+def process_zip_disk(zip_temp_path, model, conf_threshold,
+                     batch_size=4, use_half_res=True, imgsz=640, ui_update_interval=20):
+    """大文件路径：磁盘临时文件，内存安全兜底"""
+    raw_results_data = []
+    image_suffix = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
     with zipfile.ZipFile(zip_temp_path) as zip_ref:
         image_infos = []
         for info in zip_ref.infolist():
@@ -197,12 +272,7 @@ def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
 
             if len(batch_imgs) >= batch_size or idx == total -1:
                 if batch_imgs:
-                    results = model(
-                        batch_imgs,
-                        conf=conf_threshold,
-                        imgsz=imgsz,
-                        verbose=False
-                    )
+                    results = model(batch_imgs, conf=conf_threshold, imgsz=imgsz, verbose=False)
                     for name, result in zip(batch_names, results):
                         boxes = result.boxes
                         detected = []
@@ -212,23 +282,19 @@ def process_zip_stream_memory_safe(zip_temp_path, model, conf_threshold,
                                 conf = float(box.conf[0])
                                 x_center = float(box.xywh[0][0])
                                 detected.append((x_center, cls, conf))
-
                         frame_num = extract_frame_number(name)
                         time_sec = frame_num if frame_num is not None else processed_count
                         raw_results_data.append((time_sec, detected))
-                        processed_count += 1
-
+                        processed_count +=1
                     for im in batch_imgs:
                         del im
                     del batch_imgs, results
                     batch_names = []
                     batch_imgs = []
                     gc.collect()
-
                 if (idx+1) % ui_update_interval ==0 or (idx+1)==total:
                     progress_bar.progress(min((idx+1)/total,1.0))
                     status_text.text(f"已处理 {idx+1}/{total} 张")
-
         status_text.text("✅ 处理完成！")
         progress_bar.empty()
     return raw_results_data
@@ -340,7 +406,7 @@ def apply_filter(raw_results_data, filter_conf_threshold):
         results_data.append([time_sec, full_number, f"{avg_conf:.3f}"])
     return results_data
 
-# ========== 5. 主逻辑 ==========
+# ========== 主逻辑 ==========
 if input_type == "📁 图片压缩包 (ZIP)":
     uploaded_file = st.file_uploader(
         "上传图片压缩包 (ZIP)",
@@ -348,28 +414,45 @@ if input_type == "📁 图片压缩包 (ZIP)":
         help="请将图片打包成 ZIP 格式上传"
     )
     if uploaded_file is not None:
-        file_size_mb = uploaded_file.size/(1024*1024)
+        file_size = uploaded_file.size
+        file_size_mb = file_size/(1024*1024)
         st.info(f"ZIP文件大小: {file_size_mb:.1f} MB")
         if file_size_mb>300:
             st.warning("⚠️ 文件较大，处理会消耗较多时间，请耐心等待。")
 
-        # 【关键】一次读取上传流：同时写临时文件+计算md5，消除二次读取
-        tmp_zip_path, file_hash = upload_to_temp_with_hash(uploaded_file)
+        # 读取全部到BytesIO，仅一次读取上传流
+        zip_mem = io.BytesIO(uploaded_file.read())
+        file_hash = calc_md5_from_fileobj(zip_mem)
 
         if file_hash != st.session_state.processed_file_hash:
             st.info("📦 正在流式解压并识别...")
+            tmp_disk_path = None
             try:
-                raw_results_data = process_zip_stream_memory_safe(
-                    tmp_zip_path, model, conf_threshold,
-                    batch_size=batch_size,
-                    use_half_res=use_half_res,
-                    imgsz=imgsz
-                )
+                if file_size <= SIZE_THRESHOLD:
+                    # 小于等于420MB：纯内存高速路径
+                    raw_results_data = process_zip_memory(
+                        zip_mem, model, conf_threshold,
+                        batch_size=batch_size,
+                        use_half_res=use_half_res,
+                        imgsz=imgsz
+                    )
+                else:
+                    # 超过阈值：落盘磁盘兜底，防止OOM
+                    zip_mem.seek(0)
+                    tmp_disk_path, _ = upload_to_temp_with_hash(zip_mem)
+                    raw_results_data = process_zip_disk(
+                        tmp_disk_path, model, conf_threshold,
+                        batch_size=batch_size,
+                        use_half_res=use_half_res,
+                        imgsz=imgsz
+                    )
             finally:
-                try:
-                    os.unlink(tmp_zip_path)
-                except Exception:
-                    pass
+                if tmp_disk_path is not None:
+                    try:
+                        os.unlink(tmp_disk_path)
+                    except Exception:
+                        pass
+                zip_mem.close()
 
             if not raw_results_data:
                 st.error("❌ ZIP 包中未找到任何可处理的图片。")
@@ -379,10 +462,7 @@ if input_type == "📁 图片压缩包 (ZIP)":
             st.session_state.frame_images = {}
             st.session_state.processed_file_hash = file_hash
         else:
-            try:
-                os.unlink(tmp_zip_path)
-            except Exception:
-                pass
+            zip_mem.close()
             st.info("📁 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
 else:
@@ -414,7 +494,7 @@ else:
         else:
             st.info("🎬 使用已缓存的识别结果（修改筛选阈值或点击下载不会重新识别）")
 
-# ========== 6. 显示与下载结果【bzshibie1原版界面，2列下载按钮，UI零改动】 ==========
+# ========== 显示与下载结果【UI零改动】 ==========
 raw_results_data = st.session_state.raw_results_data
 frame_images = st.session_state.frame_images
 if raw_results_data:
